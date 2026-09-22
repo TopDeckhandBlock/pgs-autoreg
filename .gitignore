@@ -1,0 +1,9 @@
+anonkey.txt
+yescaptcha_key.txt
+*.jsonl
+run*.log
+*.png
+chrome_profile/
+__pycache__/
+pw.txt
+secrets.json
