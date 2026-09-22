@@ -165,18 +165,24 @@ def create_checkout(token):
 
 # ── 4. Stripe fill + hCaptcha ─────────────────────────────────────
 def yc(fn, payload):
-    return http(f"https://api.yescaptcha.com/{fn}", json.dumps(payload).encode(),
-                {"Content-Type": "application/json"})[1]
+    # always DIRECT (never via BD proxy — yesCaptcha is not geo-sensitive)
+    req = urllib.request.Request(f"https://api.yescaptcha.com/{fn}",
+                                 data=json.dumps(payload).encode(),
+                                 headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        return json.loads(r.read())
 
-def solve_hcaptcha(sitekey, pageurl):
-    r = yc("createTask", {"clientKey": YC_KEY, "task": {
-        "type": "HCaptchaTaskProxyless", "websiteURL": pageurl,
-        "websiteKey": sitekey, "isInvisible": True}})
+def solve_hcaptcha(sitekey, pageurl, rqdata=None):
+    task = {"type": "HCaptchaTaskProxyless", "websiteURL": pageurl,
+            "websiteKey": sitekey, "isInvisible": True, "enterprise": True}
+    if rqdata:
+        task["rqdata"] = rqdata
+    r = yc("createTask", {"clientKey": YC_KEY, "task": task})
     tid = r.get("taskId")
     if not tid:
         log(f"hc task err: {r}")
         return None
-    log(f"hc task {tid}")
+    log(f"hc task {tid} rqdata={bool(rqdata)}")
     for _ in range(45):
         time.sleep(4)
         res = yc("getTaskResult", {"clientKey": YC_KEY, "taskId": tid})
@@ -292,58 +298,105 @@ def _fill_and_submit(pg, checkout_url, out_prefix="chr"):
         if "success" in u or "checkout=succ" in u or "pgsgrove" in u:
             pg.screenshot(path=str(BASE_DIR / "stripe_success.png"), full_page=True)
             return True, u
-        # detect visible hCaptcha modal -> solve -> inject -> click checkbox
-        try:
-            modal = pg.evaluate("""()=>{
-                const w=document.querySelector('iframe[src*="hcaptcha.com/captcha"]');
-                if(w && w.offsetWidth>50) return true;
-                const t=document.body.innerText||'';
-                return /I am human|One more step/i.test(t);
-            }""")
-        except Exception:
-            modal = False
+        # detect hCaptcha checkbox modal — scan ALL frames, not just main page
+        modal = False
+        hc_frame = None
+        for f in pg.frames:
+            if "hcaptcha" in f.url and "invisible" not in f.url:
+                try:
+                    if f.locator("#checkbox").count() > 0:
+                        modal = True; hc_frame = f; break
+                except Exception:
+                    pass
+            if "hcaptcha.com/captcha" in f.url:
+                modal = True; hc_frame = f
+        if not modal:
+            try:
+                t = pg.evaluate("()=>document.body.innerText||''")
+                modal = bool(re.search(r"I am human|One more step", t))
+            except Exception:
+                modal = False
         if modal:
-            log("hcaptcha modal visible — solving")
-            sitekey = None
+            log("hcaptcha modal visible")
+            # STEP 1: real click on the checkbox — camoufox may pass passive evaluation
+            clicked = False
+            if hc_frame is not None:
+                try:
+                    cb = hc_frame.locator("#checkbox").first
+                    cb.click(timeout=6000, force=True)
+                    clicked = True
+                    log("checkbox clicked, waiting for passive pass...")
+                except Exception as e:
+                    log(f"checkbox click err {str(e)[:60]}")
+            if clicked:
+                passed = False
+                for _w in range(6):
+                    pg.wait_for_timeout(3000)
+                    still = False
+                    for f in pg.frames:
+                        if "hcaptcha" in f.url and "invisible" not in f.url:
+                            try:
+                                if f.locator("#checkbox").count() > 0: still = True
+                            except Exception: pass
+                    if not still:
+                        passed = True; break
+                if passed:
+                    log("captcha passed via real click!")
+                    try:
+                        fr.locator("button[type=submit]").first.click(timeout=8000)
+                    except Exception: pass
+                    continue
+                log("passive pass failed — falling back to solver")
+            # STEP 2: solve via YesCaptcha and inject (enterprise: needs rqdata)
+            sitekey = None; rqdata = None
             for f in pg.frames:
                 m = re.search(r"sitekey=([a-fA-F0-9-]+)", f.url)
                 if m and "hcaptcha" in f.url:
-                    sitekey = m.group(1); break
+                    sitekey = m.group(1)
+                    r = re.search(r"rqdata=([^&#]+)", f.url)
+                    if r: rqdata = r.group(1)
+                    break
             if not sitekey:
                 try:
                     sitekey = pg.evaluate("()=>{for(const f of document.querySelectorAll('iframe[src*=hcaptcha]')){const m=f.src.match(/sitekey=([a-fA-F0-9-]+)/);if(m)return m[1];}return null;}")
                 except Exception:
                     pass
-            log(f"sitekey: {sitekey}")
+            if not rqdata:
+                for f in pg.frames:
+                    try:
+                        srcs = f.evaluate("()=>Array.from(document.querySelectorAll('iframe')).map(i=>i.src).join('\\n')")
+                        r = re.search(r"rqdata=([^&#\"]+)", srcs or "")
+                        if r: rqdata = r.group(1); break
+                    except Exception:
+                        pass
+            log(f"sitekey: {sitekey} rqdata: {bool(rqdata)}")
             if sitekey:
-                tok = solve_hcaptcha(sitekey, checkout_url.split("#")[0])
+                tok = solve_hcaptcha(sitekey, checkout_url.split("#")[0], rqdata)
                 if tok:
                     for f in pg.frames:
                         try:
                             f.evaluate("""(token)=>{
-                                ['h-captcha-response','g-recaptcha-response'].forEach(n=>{
-                                    let el=document.querySelector(`[name="${n}"]`);
-                                    if(!el){el=document.createElement('textarea');el.name=n;el.style.display='none';document.body.appendChild(el);}
-                                    el.value=token;
-                                    el.dispatchEvent(new Event('input',{bubbles:true}));
-                                    el.dispatchEvent(new Event('change',{bubbles:true}));
-                                });
-                                if(window.hcaptcha){try{window.hcaptcha.setResponse(token);}catch(e){}}
+                                document.querySelectorAll('textarea[name="h-captcha-response"],textarea[name="g-recaptcha-response"]').forEach(ta=>{ta.value=token;});
+                                document.querySelectorAll('input[name="h-captcha-response"]').forEach(i=>{i.value=token;});
+                                if(window.hcaptcha){try{Object.keys(window.hcaptcha._psts||{}).forEach(w=>window.hcaptcha.setResponse(token,w));}catch(e){}}
+                                if(window.onHCaptchaSuccess){try{window.onHCaptchaSuccess(token);}catch(e){}}
+                                const cel=document.querySelector('[data-callback]');
+                                if(cel){const cb=cel.getAttribute('data-callback');if(window[cb]){try{window[cb](token);}catch(e){}}}
                             }""", tok)
                         except Exception:
                             pass
-                    log("token injected, clicking checkbox")
+                    # postMessage challenge-passed from inside hcaptcha frames
+                    for f in pg.frames:
+                        if "hcaptcha" in f.url:
+                            try:
+                                f.evaluate("""(token)=>{window.parent.postMessage(JSON.stringify({source:'hcaptcha',label:'challenge-closed',contents:{event:'challenge-passed',response:token,expiration:120}}),'*');}""", tok)
+                            except Exception:
+                                pass
+                    log("token injected via setResponse — waiting for callback")
+                    # setResponse triggers the captcha callback which closes the modal;
+                    # do NOT click #checkbox (that opens a visual puzzle challenge)
+                    pg.wait_for_timeout(6000)
                     try:
-                        cb = None
-                        for f in pg.frames:
-                            if "hcaptcha" in f.url:
-                                el = f.locator("#checkbox, .checkbox, input[type=checkbox]").first
-                                if el.count() > 0: cb = el; break
-                        if cb:
-                            cb.click(timeout=5000)
-                        else:
-                            pg.evaluate("()=>{const d=document.querySelector('div[role=checkbox],#checkbox');if(d)d.click();}")
-                        pg.wait_for_timeout(3000)
                         fr.locator("button[type=submit]").first.click(timeout=8000)
                         log("resubmitted after captcha")
                     except Exception as e:
@@ -421,7 +474,9 @@ def register_one(idx):
     ok, info = False, "not attempted"
     for attempt in range(3):
         try:
-            ok, info = stripe_fill(checkout, pw_proxy=bd_pw_proxy(session))
+            # NB: Bright Data zone blocks stripe.com (NS_ERROR_PROXY_FORBIDDEN),
+            # so the Stripe step runs WITHOUT proxy — camoufox alone passes Radar.
+            ok, info = stripe_fill(checkout)
         except Exception as e:
             ok, info = False, f"exc:{str(e)[:120]}"
         if ok:
