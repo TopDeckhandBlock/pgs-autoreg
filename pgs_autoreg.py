@@ -21,22 +21,87 @@ ACCOUNTS = BASE_DIR / "pgs_accounts.jsonl"
 YC_KEY = (BASE_DIR / "yescaptcha_key.txt").read_text().strip() if (BASE_DIR / "yescaptcha_key.txt").exists() else os.environ.get("YESCAPTCHA_KEY", "")
 
 CARD = SECRETS.get("card", {})
+BD = SECRETS.get("brightdata", {})          # {customer, zone, password}
+TS_SITEKEY = SECRETS.get("turnstile_sitekey", "0x4AAAAAAE_-aKARYR1q2ImK")
+
+def bd_proxy(session=None):
+    """Bright Data ISP proxy with optional sticky session. Returns urllib ProxyHandler-compatible dict or None."""
+    if not BD.get("customer"): return None
+    sess = f"-session-{session}" if session else ""
+    u = f"brd-customer-{BD['customer']}-zone-{BD.get('zone','isp_proxy1')}{sess}"
+    url = f"http://{u}:{BD.get('password','')}@brd.superproxy.io:33335"
+    return {"http": url, "https": url}
+
+def bd_pw_proxy(session=None):
+    """Same proxy split for playwright/camoufox dict format."""
+    if not BD.get("customer"): return None
+    sess = f"-session-{session}" if session else ""
+    return {"server": "http://brd.superproxy.io:33335",
+            "username": f"brd-customer-{BD['customer']}-zone-{BD.get('zone','isp_proxy1')}{sess}",
+            "password": BD.get("password", "")}
+
+def openers(proxy=None):
+    """urllib opener that optionally routes through proxy."""
+    if proxy:
+        return urllib.request.build_opener(urllib.request.ProxyHandler(proxy))
+    return urllib.request.build_opener()
+
+OPENER = openers()  # replaced per-account in main()
 
 def log(m): print(f"[{datetime.now().strftime('%H:%M:%S')}] {m}", flush=True)
 
 def http(url, data, headers, timeout=30):
     req = urllib.request.Request(url, data=data, headers=headers)
-    with urllib.request.urlopen(req, timeout=timeout) as r:
+    with OPENER.open(req, timeout=timeout) as r:
         return r.status, json.loads(r.read() or b"{}")
+
+def http_raw(url, data, headers, timeout=30):
+    """Like http() but tolerates non-JSON responses."""
+    req = urllib.request.Request(url, data=data, headers=headers)
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        raw = r.read()
+        try:
+            return r.status, json.loads(raw or b"{}")
+        except Exception:
+            return r.status, {"_raw": raw[:300].decode("utf-8", "ignore")}
 
 def gen_email(n):
     tag = "pgs" + "".join(random.choices(string.ascii_lowercase + string.digits, k=9))
     return f"{GMAIL_USER.split('@')[0]}+{tag}@gmail.com"
 
+# ── 0. Turnstile (Supabase signup captcha) ────────────────────────
+def solve_turnstile(page_url="https://api.pgsgrove.com/login", tries=3):
+    for k in range(tries):
+        r = yc_api("createTask", {"clientKey": YC_KEY, "task": {
+            "type": "TurnstileTaskProxyless", "websiteURL": page_url, "websiteKey": TS_SITEKEY}})
+        tid = r.get("taskId")
+        if not tid:
+            continue
+        for _ in range(40):
+            time.sleep(3)
+            res = yc_api("getTaskResult", {"clientKey": YC_KEY, "taskId": tid})
+            if res.get("status") == "ready":
+                return res["solution"]["token"]
+            if res.get("errorId"):
+                log(f"turnstile attempt {k}: {res.get('errorCode')}")
+                break
+    return None
+
+def yc_api(fn, payload):
+    req = urllib.request.Request(f"https://api.yescaptcha.com/{fn}",
+                                 data=json.dumps(payload).encode(),
+                                 headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        return json.loads(r.read())
+
 # ── 1. Signup ─────────────────────────────────────────────────────
 def signup(email):
+    ctok = solve_turnstile()
+    if not ctok:
+        return {"error": "turnstile_failed"}
     body = json.dumps({"email": email, "password": PASSWORD,
-                       "data": {"signup_source": "api"}}).encode()
+                       "data": {"signup_source": "api"},
+                       "gotrue_meta_security": {"captcha_token": ctok}}).encode()
     st, d = http(f"{SUPABASE}/auth/v1/signup", body,
                  {"Content-Type": "application/json", "apikey": ANON_KEY})
     return d
@@ -72,11 +137,14 @@ def wait_verify_link(email_tag, timeout=180):
         time.sleep(6)
     return None
 
-def verify_email(link):
+def verify_email(link, proxy=None):
     """Follow verify link, grab access_token from 303 Location fragment."""
     class NoRedir(urllib.request.HTTPRedirectHandler):
         def redirect_request(self, *a, **k): return None
-    op = urllib.request.build_opener(NoRedir)
+    handlers = [NoRedir]
+    if proxy:
+        handlers.append(urllib.request.ProxyHandler(proxy))
+    op = urllib.request.build_opener(*handlers)
     try:
         r = op.open(link, timeout=25)
         loc = r.url
@@ -119,153 +187,180 @@ def solve_hcaptcha(sitekey, pageurl):
             return None
     return None
 
-def stripe_fill(checkout_url):
+def stripe_fill(checkout_url, pw_proxy=None):
+    use_camoufox = True
+    try:
+        from camoufox.sync_api import Camoufox  # noqa
+    except Exception:
+        use_camoufox = False
+    if use_camoufox:
+        try:
+            return _stripe_fill_camoufox(checkout_url, pw_proxy)
+        except Exception as e:
+            log(f"camoufox path failed ({str(e)[:80]}) — falling back to chrome")
+    return _stripe_fill_chrome(checkout_url, pw_proxy)
+
+def _stripe_fill_camoufox(checkout_url, pw_proxy=None):
+    from camoufox.sync_api import Camoufox
+    with Camoufox(proxy=pw_proxy, os=["windows"], headless=False,
+                  geoip=bool(pw_proxy)) as browser:
+        pg = browser.new_page()
+        pg.goto(checkout_url, timeout=90000, wait_until="domcontentloaded")
+        pg.wait_for_timeout(8000)
+        log(f"camoufox title: {pg.title()}")
+        return _fill_and_submit(pg, checkout_url, out_prefix="cam")
+
+def _stripe_fill_chrome(checkout_url, pw_proxy=None):
     from playwright.sync_api import sync_playwright
     with sync_playwright() as p:
         b = p.chromium.launch(headless=False, channel="chrome",
                               args=["--disable-blink-features=AutomationControlled"])
         ctx = b.new_context(viewport={"width": 1280, "height": 950}, locale="en-US",
-                            timezone_id="America/Chicago",
+                            timezone_id="America/Chicago", proxy=pw_proxy,
                             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                                        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36")
         pg = ctx.new_page()
         pg.add_init_script("Object.defineProperty(navigator,'webdriver',{get:()=>undefined});")
         pg.goto(checkout_url, timeout=90000, wait_until="commit")
-        # wait for card form frame (up to 90s)
-        fr = None
-        for _ in range(18):
-            pg.wait_for_timeout(5000)
-            for f in pg.frames:
-                try:
-                    if f.locator('input[name="cardNumber"]').count() > 0:
-                        fr = f; break
-                except Exception:
-                    pass
-            if fr: break
-        if not fr:
-            pg.screenshot(path=str(BASE_DIR / "fail_noform.png"))
+        ok, info = _fill_and_submit(pg, checkout_url, out_prefix="chr")
+        b.close()
+        return ok, info
+
+def _fill_and_submit(pg, checkout_url, out_prefix="chr"):
+    # wait for card form frame (up to 90s)
+    fr = None
+    for _ in range(18):
+        pg.wait_for_timeout(5000)
+        for f in pg.frames:
             try:
-                (BASE_DIR / "fail_noform.html").write_text(pg.content(), encoding="utf-8")
+                if f.locator('input[name="cardNumber"]').count() > 0:
+                    fr = f; break
             except Exception:
                 pass
-            b.close(); return False, "no card form"
-        log("stripe form found")
+        if fr: break
+    if not fr:
+        pg.screenshot(path=str(BASE_DIR / "fail_noform.png"))
         try:
-            fr.locator("text=USD").first.click(timeout=5000)
-            pg.wait_for_timeout(1200)
+            (BASE_DIR / "fail_noform.html").write_text(pg.content(), encoding="utf-8")
         except Exception:
             pass
-        for n, v in [("cardNumber", CARD["num"]), ("cardExpiry", CARD["exp"]),
-                     ("cardCvc", CARD["cvc"]), ("billingName", CARD["name"])]:
-            el = fr.locator(f'input[name="{n}"]').first
-            el.click(timeout=8000); el.type(v, delay=80)
-            pg.wait_for_timeout(500)
-        log("card typed")
+        return False, "no card form"
+    log("stripe form found")
+    try:
+        fr.locator("text=USD").first.click(timeout=5000)
+        pg.wait_for_timeout(1200)
+    except Exception:
+        pass
+    for n, v in [("cardNumber", CARD["num"]), ("cardExpiry", CARD["exp"]),
+                 ("cardCvc", CARD["cvc"]), ("billingName", CARD["name"])]:
+        el = fr.locator(f'input[name="{n}"]').first
+        el.click(timeout=8000); el.type(v, delay=80)
+        pg.wait_for_timeout(500)
+    log("card typed")
+    try:
+        fr.locator('select[name="billingCountry"]').first.select_option(
+            label="United States", timeout=8000)
+        pg.wait_for_timeout(2500)
+    except Exception as e:
+        log(f"country err {e}")
+    for n, v in [("billingAddressLine1", CARD["addr"]),
+                 ("billingLocality", CARD["city"]),
+                 ("billingPostalCode", CARD["zip"])]:
+        for a in range(4):
+            try:
+                el = fr.locator(f'input[name="{n}"]').first
+                el.wait_for(state="visible", timeout=6000)
+                el.fill(v, timeout=6000)
+                pg.wait_for_timeout(400)
+                break
+            except Exception:
+                pg.wait_for_timeout(1500)
+    try:
+        fr.locator('select[name="billingAdministrativeArea"]').first.select_option(
+            label=CARD["state"], timeout=8000)
+        pg.wait_for_timeout(1000)
+    except Exception as e:
+        log(f"state err {e}")
+    pg.screenshot(path=str(BASE_DIR / "stripe_filled.png"), full_page=True)
+    # submit FIRST — hCaptcha checkbox modal appears after submit
+    fr.locator("button[type=submit]").first.click(timeout=10000)
+    log("submitted")
+    for i in range(30):
+        pg.wait_for_timeout(5000)
+        u = pg.url
+        log(f"t+{(i+1)*5}s {u[:90]}")
+        if "success" in u or "checkout=succ" in u or "pgsgrove" in u:
+            pg.screenshot(path=str(BASE_DIR / "stripe_success.png"), full_page=True)
+            return True, u
+        # detect visible hCaptcha modal -> solve -> inject -> click checkbox
         try:
-            fr.locator('select[name="billingCountry"]').first.select_option(
-                label="United States", timeout=8000)
-            pg.wait_for_timeout(2500)
-        except Exception as e:
-            log(f"country err {e}")
-        for n, v in [("billingAddressLine1", CARD["addr"]),
-                     ("billingLocality", CARD["city"]),
-                     ("billingPostalCode", CARD["zip"])]:
-            for a in range(4):
+            modal = pg.evaluate("""()=>{
+                const w=document.querySelector('iframe[src*="hcaptcha.com/captcha"]');
+                if(w && w.offsetWidth>50) return true;
+                const t=document.body.innerText||'';
+                return /I am human|One more step/i.test(t);
+            }""")
+        except Exception:
+            modal = False
+        if modal:
+            log("hcaptcha modal visible — solving")
+            sitekey = None
+            for f in pg.frames:
+                m = re.search(r"sitekey=([a-fA-F0-9-]+)", f.url)
+                if m and "hcaptcha" in f.url:
+                    sitekey = m.group(1); break
+            if not sitekey:
                 try:
-                    el = fr.locator(f'input[name="{n}"]').first
-                    el.wait_for(state="visible", timeout=6000)
-                    el.fill(v, timeout=6000)
-                    pg.wait_for_timeout(400)
-                    break
+                    sitekey = pg.evaluate("()=>{for(const f of document.querySelectorAll('iframe[src*=hcaptcha]')){const m=f.src.match(/sitekey=([a-fA-F0-9-]+)/);if(m)return m[1];}return null;}")
                 except Exception:
-                    pg.wait_for_timeout(1500)
-        try:
-            fr.locator('select[name="billingAdministrativeArea"]').first.select_option(
-                label=CARD["state"], timeout=8000)
-            pg.wait_for_timeout(1000)
-        except Exception as e:
-            log(f"state err {e}")
-        pg.screenshot(path=str(BASE_DIR / "stripe_filled.png"), full_page=True)
-        # submit FIRST — hCaptcha checkbox modal appears after submit
-        fr.locator("button[type=submit]").first.click(timeout=10000)
-        log("submitted")
-        for i in range(30):
-            pg.wait_for_timeout(5000)
-            u = pg.url
-            log(f"t+{(i+1)*5}s {u[:90]}")
-            if "success" in u or "checkout=succ" in u or "pgsgrove" in u:
-                pg.screenshot(path=str(BASE_DIR / "stripe_success.png"), full_page=True)
-                b.close(); return True, u
-            # detect visible hCaptcha modal -> solve -> inject -> click checkbox
-            try:
-                modal = pg.evaluate("""()=>{
-                    const w=document.querySelector('iframe[src*="hcaptcha.com/captcha"]');
-                    if(w && w.offsetWidth>50) return true;
-                    const t=document.body.innerText||'';
-                    return /I am human|One more step/i.test(t);
-                }""")
-            except Exception:
-                modal = False
-            if modal:
-                log("hcaptcha modal visible — solving")
-                sitekey = None
-                for f in pg.frames:
-                    m = re.search(r"sitekey=([a-fA-F0-9-]+)", f.url)
-                    if m and "hcaptcha" in f.url:
-                        sitekey = m.group(1); break
-                if not sitekey:
-                    try:
-                        sitekey = pg.evaluate("()=>{for(const f of document.querySelectorAll('iframe[src*=hcaptcha]')){const m=f.src.match(/sitekey=([a-fA-F0-9-]+)/);if(m)return m[1];}return null;}")
-                    except Exception:
-                        pass
-                log(f"sitekey: {sitekey}")
-                if sitekey:
-                    tok = solve_hcaptcha(sitekey, checkout_url.split("#")[0])
-                    if tok:
-                        for f in pg.frames:
-                            try:
-                                f.evaluate("""(token)=>{
-                                    ['h-captcha-response','g-recaptcha-response'].forEach(n=>{
-                                        let el=document.querySelector(`[name="${n}"]`);
-                                        if(!el){el=document.createElement('textarea');el.name=n;el.style.display='none';document.body.appendChild(el);}
-                                        el.value=token;
-                                        el.dispatchEvent(new Event('input',{bubbles:true}));
-                                        el.dispatchEvent(new Event('change',{bubbles:true}));
-                                    });
-                                    if(window.hcaptcha){try{window.hcaptcha.setResponse(token);}catch(e){}}
-                                }""", tok)
-                            except Exception:
-                                pass
-                        log("token injected, clicking checkbox")
+                    pass
+            log(f"sitekey: {sitekey}")
+            if sitekey:
+                tok = solve_hcaptcha(sitekey, checkout_url.split("#")[0])
+                if tok:
+                    for f in pg.frames:
                         try:
-                            cb = None
-                            for f in pg.frames:
-                                if "hcaptcha" in f.url:
-                                    el = f.locator("#checkbox, .checkbox, input[type=checkbox]").first
-                                    if el.count() > 0: cb = el; break
-                            if cb:
-                                cb.click(timeout=5000)
-                            else:
-                                pg.evaluate("()=>{const d=document.querySelector('div[role=checkbox],#checkbox');if(d)d.click();}")
-                            pg.wait_for_timeout(3000)
-                            fr.locator("button[type=submit]").first.click(timeout=8000)
-                            log("resubmitted after captcha")
-                        except Exception as e:
-                            log(f"resubmit err {str(e)[:80]}")
-            try:
-                al = [a for a in fr.locator('[role=alert]').all_inner_texts() if a.strip()]
-                if al: log(f"ALERT: {al[:2]}")
-                # stripe "connection issues" -> re-click submit (up to 3 times)
-                body_txt = pg.evaluate("()=>document.body.innerText||''")
-                if "connection issues" in body_txt and i % 3 == 0:
-                    log("connection issues banner — resubmitting")
-                    fr.locator("button[type=submit]").first.click(timeout=8000)
-            except Exception:
-                pass
-        pg.screenshot(path=str(BASE_DIR / "stripe_after.png"), full_page=True)
-        final = pg.url
-        b.close()
-        return False, final
+                            f.evaluate("""(token)=>{
+                                ['h-captcha-response','g-recaptcha-response'].forEach(n=>{
+                                    let el=document.querySelector(`[name="${n}"]`);
+                                    if(!el){el=document.createElement('textarea');el.name=n;el.style.display='none';document.body.appendChild(el);}
+                                    el.value=token;
+                                    el.dispatchEvent(new Event('input',{bubbles:true}));
+                                    el.dispatchEvent(new Event('change',{bubbles:true}));
+                                });
+                                if(window.hcaptcha){try{window.hcaptcha.setResponse(token);}catch(e){}}
+                            }""", tok)
+                        except Exception:
+                            pass
+                    log("token injected, clicking checkbox")
+                    try:
+                        cb = None
+                        for f in pg.frames:
+                            if "hcaptcha" in f.url:
+                                el = f.locator("#checkbox, .checkbox, input[type=checkbox]").first
+                                if el.count() > 0: cb = el; break
+                        if cb:
+                            cb.click(timeout=5000)
+                        else:
+                            pg.evaluate("()=>{const d=document.querySelector('div[role=checkbox],#checkbox');if(d)d.click();}")
+                        pg.wait_for_timeout(3000)
+                        fr.locator("button[type=submit]").first.click(timeout=8000)
+                        log("resubmitted after captcha")
+                    except Exception as e:
+                        log(f"resubmit err {str(e)[:80]}")
+        try:
+            al = [a for a in fr.locator('[role=alert]').all_inner_texts() if a.strip()]
+            if al: log(f"ALERT: {al[:2]}")
+            # stripe "connection issues" -> re-click submit (up to 3 times)
+            body_txt = pg.evaluate("()=>document.body.innerText||''")
+            if "connection issues" in body_txt and i % 3 == 0:
+                log("connection issues banner — resubmitting")
+                fr.locator("button[type=submit]").first.click(timeout=8000)
+        except Exception:
+            pass
+    pg.screenshot(path=str(BASE_DIR / "stripe_after.png"), full_page=True)
+    final = pg.url
+    return False, final
 
 # ── 5. Mint plan key ──────────────────────────────────────────────
 def mint_key(token):
@@ -293,10 +388,16 @@ def test_key(key):
 
 # ── Main ──────────────────────────────────────────────────────────
 def register_one(idx):
+    global OPENER
     rec = {"idx": idx, "ts": datetime.now().isoformat(), "status": "start"}
     em = gen_email(idx)
     rec["email"] = em
-    log(f"[{idx}] {em}")
+    # per-account sticky Bright Data session (US exit) — signup/checkout/verify all via proxy
+    session = "".join(random.choices(string.ascii_lowercase + string.digits, k=8))
+    rec["bd_session"] = session
+    prox = bd_proxy(session)
+    OPENER = openers(prox)
+    log(f"[{idx}] {em} (bd session {session})")
     try:
         d = signup(em)
         if not d.get("id"):
@@ -309,7 +410,7 @@ def register_one(idx):
     if not link:
         rec["status"] = "no_verify_mail"; return rec
     rec["status"] = "mail_found"
-    token = verify_email(link)
+    token = verify_email(link, prox)
     if not token:
         rec["status"] = "verify_fail"; return rec
     rec["status"] = "verified"
@@ -320,7 +421,7 @@ def register_one(idx):
     ok, info = False, "not attempted"
     for attempt in range(3):
         try:
-            ok, info = stripe_fill(checkout)
+            ok, info = stripe_fill(checkout, pw_proxy=bd_pw_proxy(session))
         except Exception as e:
             ok, info = False, f"exc:{str(e)[:120]}"
         if ok:
